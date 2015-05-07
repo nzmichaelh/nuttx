@@ -7,6 +7,10 @@ before_script:
  - arm-none-eabi-gcc --version
 compiler:
   - gcc
+env:
+  matrix:
+    - CONFIG=teensy-lc/nsh
 script:
+  - "echo $CONFIG"
   - "cd nuttx/tools && ./configure teensy-lc/nsh"
   - make -C nuttx
