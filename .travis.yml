@@ -1,0 +1,12 @@
+language: c
+before_install:
+  - sudo add-apt-repository -y ppa:terry.guo/gcc-arm-embedded
+  - sudo apt-get update -q
+  - sudo apt-get install -yq gcc-arm-none-eabi
+before_script:
+ - arm-none-eabi-gcc --version
+compiler:
+  - gcc
+script:
+  - "cd nuttx/tools && ./configure teensy-lc/nsh"
+  - make -C nuttx
