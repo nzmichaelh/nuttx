@@ -1,8 +1,8 @@
 language: c
 before_install:
   - sudo add-apt-repository -y ppa:terry.guo/gcc-arm-embedded
-  - sudo apt-get update -q
-  - sudo apt-get install -yq gcc-arm-none-eabi
+  - sudo apt-get update -qq
+  - sudo apt-get install -qq gcc-arm-none-eabi
 before_script:
  - arm-none-eabi-gcc --version
 compiler:
@@ -11,6 +11,7 @@ env:
   matrix:
     - CONFIG=teensy-lc/nsh
 script:
-  - "echo $CONFIG"
-  - "cd nuttx/tools && ./configure teensy-lc/nsh"
-  - make -C nuttx
+  - make -sC nuttx distclean
+  - pushd nuttx/tools && ./configure.sh $CONFIG && popd
+  - make -sC nuttx oldconfig
+  - make -sC nuttx
