@@ -10,8 +10,17 @@ compiler:
 env:
   matrix:
     - CONFIG=teensy-lc/nsh
+    - CONFIG=sama5d4-ek/nsh
+    - CONFIG=stm32f4discovery/netnsh
 script:
-  - make -sC nuttx distclean
-  - pushd nuttx/tools && ./configure.sh $CONFIG && popd
-  - make -sC nuttx oldconfig
-  - make -sC nuttx
+  - cd nuttx
+  - make -s distclean
+  - sed -ri "s/^CONFIG_HOST_WINDOWS=y/CONFIG_HOST_LINUX=y/" configs/$CONFIG/defconfig
+  - sed -ri "s/^CONFIG_WINDOWS_CYGWIN=y/#/" configs/$CONFIG/defconfig
+  - sed -ri "s/^CONFIG_ARMV7M_TOOLCHAIN_.+=y/CONFIG_ARMV7M_TOOLCHAIN_GNU_EABIL=y/" configs/$CONFIG/defconfig
+  - pushd tools && ./configure.sh $CONFIG && popd
+  - make -s
+
+--  - CONFIG=samv71-xult/nsh: fails (VFP; flag conflict)
+--  - CONFIG=dk-tm4c129x/nsh: fails (duplicates symbol, VFP)
+-- #  - sed -i "s/^(CONFIG_ARMV7M_TOOLCHAIN)_.+=y/CONFIG_ARMV7M_TOOLCHAIN_GNU_EABIL=y/" configs/$CONFIG/defconfig
