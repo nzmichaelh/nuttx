@@ -448,8 +448,8 @@ static ssize_t stm32_transfer(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep
 static int stm32_asynch(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep,
                         FAR uint8_t *buffer, size_t buflen,
                         usbhost_asynch_t callback, FAR void *arg);
-static int stm32_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #endif
+static int stm32_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #ifdef CONFIG_USBHOST_HUB
 static int stm32_connect(FAR struct usbhost_driver_s *drvr,
                          FAR struct usbhost_hubport_s *hport,
@@ -1877,14 +1877,14 @@ static ssize_t stm32_in_transfer(FAR struct stm32_usbhost_s *priv, int chidx,
           /* Check for a special case:  If (1) the transfer was NAKed and (2)
            * no Tx FIFO empty or Rx FIFO not-empty event occurred, then we
            * should be able to just flush the Rx and Tx FIFOs and try again.
-           * We can detect this latter case becasue the then the transfer
+           * We can detect this latter case because the then the transfer
            * buffer pointer and buffer size will be unaltered.
            */
 
           elapsed = clock_systimer() - start;
-          if (ret != -EAGAIN ||                       /* Not a NAK condition OR */
-              elapsed >= STM32_DATANAK_DELAY ||       /* Timeout has elapsed OR */
-               chan->xfrd > 0)                        /* Data has been partially transferred */
+          if (ret != -EAGAIN ||                  /* Not a NAK condition OR */
+              elapsed >= STM32_DATANAK_DELAY ||  /* Timeout has elapsed OR */
+              chan->xfrd > 0)                    /* Data has been partially transferred */
             {
               /* Break out and return the error */
 
@@ -2143,14 +2143,14 @@ static ssize_t stm32_out_transfer(FAR struct stm32_usbhost_s *priv, int chidx,
           /* Check for a special case:  If (1) the transfer was NAKed and (2)
            * no Tx FIFO empty or Rx FIFO not-empty event occurred, then we
            * should be able to just flush the Rx and Tx FIFOs and try again.
-           * We can detect this latter case becasue the then the transfer
+           * We can detect this latter case because the then the transfer
            * buffer pointer and buffer size will be unaltered.
            */
 
           elapsed = clock_systimer() - start;
-          if (ret != -EAGAIN ||                     /* Not a NAK condition OR */
-              elapsed >= STM32_DATANAK_DELAY ||     /* Timeout has elapsed OR */
-              chan->xfrd != xfrlen)                 /* Data has been partially transferred */
+          if (ret != -EAGAIN ||                  /* Not a NAK condition OR */
+              elapsed >= STM32_DATANAK_DELAY ||  /* Timeout has elapsed OR */
+              chan->xfrd > 0)                    /* Data has been partially transferred */
             {
               /* Break out and return the error */
 
@@ -4610,7 +4610,8 @@ static int stm32_asynch(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep,
  * Name: stm32_cancel
  *
  * Description:
- *   Cancel a pending asynchronous transfer on an endpoint.
+ *   Cancel a pending transfer on an endpoint.  Cancelled synchronous or
+ *   asynchronous transfer will complete normally with the error -ESHUTDOWN.
  *
  * Input Parameters:
  *   drvr - The USB host driver instance obtained as a parameter from the call to
@@ -4624,15 +4625,17 @@ static int stm32_asynch(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep,
  *
  ************************************************************************************/
 
-#ifdef CONFIG_USBHOST_ASYNCH
 static int stm32_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
 {
   FAR struct stm32_usbhost_s *priv  = (FAR struct stm32_usbhost_s *)drvr;
+  FAR struct stm32_chan_s *chan;
   unsigned int chidx = (unsigned int)ep;
   irqstate_t flags;
 
   uvdbg("chidx: %u: %d\n",  chidx);
+
   DEBUGASSERT(priv && chidx < STM32_MAX_TX_FIFOS);
+  chan = &priv->chan[chidx];
 
   /* We must have exclusive access to the USB host hardware and state structures.
    * And when we have that, we need to disable interrupts to avoid race conditions
@@ -4645,6 +4648,48 @@ static int stm32_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
   /* Halt the channel */
 
   stm32_chan_halt(priv, chidx, CHREASON_CANCELLED);
+  chan->result = -ESHUTDOWN;
+
+  /* Is there a thread waiting for this transfer to complete? */
+
+  if (chan->waiter)
+    {
+#ifdef CONFIG_USBHOST_ASYNCH
+      /* Yes.. there should not also be a callback scheduled */
+
+      DEBUGASSERT(chan->callback == NULL);
+#endif
+
+      /* Wake'em up! */
+
+      stm32_givesem(&chan->waitsem);
+      chan->waiter = false;
+    }
+
+#ifdef CONFIG_USBHOST_ASYNCH
+  /* No.. is an asynchronous callback expected when the transfer
+   * completes?
+   */
+
+  else if (chan->callback)
+    {
+      usbhost_asynch_t callback;
+      FAR void *arg;
+
+      /* Extract the callback information */
+
+      callback       = chan->callback;
+      arg            = chan->arg;
+
+      chan->callback = NULL;
+      chan->arg      = NULL;
+      chan->xfrd     = 0;
+
+      /* Then perform the callback */
+
+      callback(arg, -ESHUTDOWN);
+    }
+#endif
 
   irqrestore(flags);
   stm32_givesem(&priv->exclsem);
@@ -5021,8 +5066,8 @@ static inline void stm32_sw_initialize(FAR struct stm32_usbhost_s *priv)
   drvr->transfer       = stm32_transfer;
 #ifdef CONFIG_USBHOST_ASYNCH
   drvr->asynch         = stm32_asynch;
-  drvr->cancel         = stm32_cancel;
 #endif
+  drvr->cancel         = stm32_cancel;
 #ifdef CONFIG_USBHOST_HUB
   drvr->connect        = stm32_connect;
 #endif

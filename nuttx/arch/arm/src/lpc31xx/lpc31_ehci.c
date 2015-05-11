@@ -551,8 +551,8 @@ static ssize_t lpc31_transfer(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep
 static int lpc31_asynch(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep,
          FAR uint8_t *buffer, size_t buflen, usbhost_asynch_t callback,
          FAR void *arg);
-static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #endif
+static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #ifdef CONFIG_USBHOST_HUB
 static int lpc31_connect(FAR struct usbhost_driver_s *drvr,
          FAR struct usbhost_hubport_s *hport, bool connected);
@@ -3822,7 +3822,7 @@ static int lpc31_enumerate(FAR struct usbhost_connection_s *conn,
       usbhost_trace2(EHCI_TRACE2_CLASSENUM_FAILED, hport->port + 1, -ret);
 
       /* If this is a root hub port, then marking the hub port not connected will
-       * cause sam_wait() to return and we will try the connection again.
+       * cause lpc31_wait() to return and we will try the connection again.
        */
 
       hport->connected = false;
@@ -4475,7 +4475,8 @@ errout_with_sem:
  * Name: lpc31_cancel
  *
  * Description:
- *   Cancel a pending asynchronous transfer on an endpoint.
+ *   Cancel a pending transfer on an endpoint.  Cancelled synchronous or
+ *   asynchronous transfer will complete normally with the error -ESHUTDOWN.
  *
  * Input Parameters:
  *   drvr - The USB host driver instance obtained as a parameter from the call to
@@ -4489,13 +4490,17 @@ errout_with_sem:
  *
  ************************************************************************************/
 
-#ifdef CONFIG_USBHOST_ASYNCH
 static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
 {
   struct lpc31_epinfo_s *epinfo = (struct lpc31_epinfo_s *)ep;
   struct lpc31_qh_s *qh;
+#ifdef CONFIG_USBHOST_ASYNCH
+  usbhost_asynch_t callback;
+  void *arg;
+#endif
   uint32_t *bp;
   irqstate_t flags;
+  bool iocwait;
   int ret;
 
   DEBUGASSERT(epinfo);
@@ -4507,15 +4512,25 @@ static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
 
   lpc31_takesem(&g_ehci.exclsem);
 
-  /* If there is no asynchronous transfer in progress, then bail now */
+  /* Sample and reset all transfer termination information.  This will prevent any
+   * callbacks from occurring while are performing the cancellation.  The transfer
+   * may still be in progress, however, so this does not eliminate other DMA-
+   * related race conditions.
+   */
 
   flags = irqsave();
-  if (epinfo->callback == NULL)
-    {
-      ret = -EINVAL;
-      irqrestore(flags);
-      goto errout_with_sem;
-    }
+#ifdef CONFIG_USBHOST_ASYNCH
+  callback         = epinfo->callback;
+  arg              = epinfo->arg;
+#endif
+  iocwait          = epinfo->iocwait;
+
+#ifdef CONFIG_USBHOST_ASYNCH
+  epinfo->callback = NULL;
+  epinfo->arg      = NULL;
+#endif
+  epinfo->iocwait  = false;
+  irqrestore(flags);
 
   /* This will prevent any callbacks from occurring while are performing
    * the cancellation.  The transfer may still be in progress, however, so
@@ -4525,6 +4540,18 @@ static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
   epinfo->callback = NULL;
   epinfo->arg      = NULL;
   irqrestore(flags);
+
+  /* Bail if there is no transfer in progress for this endpoint */
+
+#ifdef CONFIG_USBHOST_ASYNCH
+  if (callback == NULL && !iocwait)
+#else
+  if (!iocwait)
+#endif
+    {
+      ret = OK;
+      goto errout_with_sem;
+    }
 
   /* Handle the cancellation according to the type of the transfer */
 
@@ -4549,7 +4576,8 @@ static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
             {
               /* Claim that we successfully cancelled the transfer */
 
-              return OK;
+              ret = OK;
+              goto exit_terminate;
             }
         }
         break;
@@ -4569,7 +4597,8 @@ static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
                * cancelled the transfer.
                */
 
-              return OK;
+              ret = OK;
+              goto exit_terminate;
             }
         }
         break;
@@ -4602,11 +4631,38 @@ static int lpc31_cancel(FAR struct usbhost_driver_s *drvr, usbhost_ep_t ep)
       usbhost_trace1(EHCI_TRACE1_QTDFOREACH_FAILED, -ret);
     }
 
+  /* Was there a pending synchronous transfer? */
+
+exit_terminate:
+  epinfo->result = -ESHUTDOWN;
+#ifdef CONFIG_USBHOST_ASYNCH
+  if (iocwait)
+    {
+      /* Yes... wake it up */
+
+      DEBUGASSERT(callback == NULL);
+      lpc31_givesem(&epinfo->iocsem);
+    }
+
+  /* No.. Is there a pending asynchronous transfer? */
+
+  else /* if (callback != NULL) */
+    {
+      /* Yes.. perform the callback */
+
+      callback(arg, -ESHUTDOWN);
+    }
+
+#else
+  /* Wake up the waiting thread */
+
+  sam_givesem(&epinfo->iocsem);
+#endif
+
 errout_with_sem:
   lpc31_givesem(&g_ehci.exclsem);
   return ret;
 }
-#endif /* CONFIG_USBHOST_ASYNCH */
 
 /************************************************************************************
  * Name: lpc31_connect
@@ -4899,8 +4955,8 @@ FAR struct usbhost_connection_s *lpc31_ehci_initialize(int controller)
       rhport->drvr.transfer       = lpc31_transfer;
 #ifdef CONFIG_USBHOST_ASYNCH
       rhport->drvr.asynch         = lpc31_asynch;
-      rhport->drvr.cancel         = lpc31_cancel;
 #endif
+      rhport->drvr.cancel         = lpc31_cancel;
 #ifdef CONFIG_USBHOST_HUB
       rhport->drvr.connect        = lpc31_connect;
 #endif

@@ -224,9 +224,9 @@ struct sam_eplist_s
 #ifdef CONFIG_USBHOST_ASYNCH
   usbhost_asynch_t  callback;  /* Transfer complete callback */
   void             *arg;       /* Argument that accompanies the callback */
-  uint16_t          buflen;    /* Length of the buffer */
 #endif
   uint8_t          *buffer;    /* Buffer being transferred */
+  uint16_t          buflen;    /* Length of the buffer */
   uint16_t          xfrd;      /* Number of bytes completed in the last transfer */
   struct sam_ed_s  *ed;        /* Endpoint descriptor (ED) */
   struct sam_gtd_s *tail;      /* Tail transfer descriptor (TD) */
@@ -400,7 +400,8 @@ static int sam_enqueuetd(struct sam_rhport_s *rhport, struct sam_eplist_s *eplis
                          volatile uint8_t *buffer, size_t buflen);
 static int  sam_ep0enqueue(struct sam_rhport_s *rhport);
 static void sam_ep0dequeue(struct sam_eplist_s *ep0);
-static int  sam_wdhwait(struct sam_rhport_s *rhport, struct sam_ed_s *ed);
+static int  sam_wdhwait(struct sam_rhport_s *rhport, struct sam_ed_s *ed,
+                        uint8_t *buffer, uint16_t buflen);
 #ifdef CONFIG_USBHOST_ASYNCH
 static int  sam_wdhasynch(struct sam_rhport_s *rhport, struct sam_ed_s *ed,
                           usbhost_asynch_t callback, void *arg,
@@ -452,8 +453,8 @@ static void sam_asynch_completion(struct sam_eplist_s *eplist);
 static int sam_asynch(struct usbhost_driver_s *drvr, usbhost_ep_t ep,
                       uint8_t *buffer, size_t buflen,
                       usbhost_asynch_t callback, void *arg);
-static int sam_cancel(struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #endif
+static int sam_cancel(struct usbhost_driver_s *drvr, usbhost_ep_t ep);
 #ifdef CONFIG_USBHOST_HUB
 static int sam_connect(struct usbhost_driver_s *drvr,
                        struct usbhost_hubport_s *hport,
@@ -1735,7 +1736,8 @@ static void sam_ep0dequeue(struct sam_eplist_s *ep0)
  *
  *******************************************************************************/
 
-static int sam_wdhwait(struct sam_rhport_s *rhport, struct sam_ed_s *ed)
+static int sam_wdhwait(struct sam_rhport_s *rhport, struct sam_ed_s *ed,
+                       uint8_t *buffer, uint16_t buflen)
 {
   struct sam_eplist_s *eplist;
   irqstate_t flags = irqsave();
@@ -1759,9 +1761,9 @@ static int sam_wdhwait(struct sam_rhport_s *rhport, struct sam_ed_s *ed)
 #ifdef CONFIG_USBHOST_ASYNCH
       eplist->callback = NULL;
       eplist->arg      = NULL;
-      eplist->buffer   = NULL;
-      eplist->buflen   = 0;
 #endif
+      eplist->buffer   = buffer;
+      eplist->buflen   = buflen;
       ret              = OK;
     }
 
@@ -1843,7 +1845,7 @@ static int sam_ctrltd(struct sam_rhport_s *rhport, struct sam_eplist_s *eplist,
    */
 
   edctrl = eplist->ed;
-  ret = sam_wdhwait(rhport, edctrl);
+  ret = sam_wdhwait(rhport, edctrl, buffer, buflen);
   if (ret != OK)
     {
       usbhost_trace1(OHCI_TRACE1_DEVDISCONN, RHPORT(rhport));
@@ -1912,7 +1914,7 @@ static int sam_ctrltd(struct sam_rhport_s *rhport, struct sam_eplist_s *eplist,
         {
           usbhost_trace2(OHCI_TRACE2_BADTDSTATUS, RHPORT(rhport),
                          edctrl->tdstatus);
-          ret = -EIO;
+          ret = edctrl->tdstatus == TD_CC_STALL ? -EPERM : -EIO;
         }
     }
 
@@ -2156,12 +2158,18 @@ static void sam_wdh_bottomhalf(void)
 #endif
 
       /* Determine the number of bytes actually transfer by* subtracting the
-       * buffer start address from the CBP.  But be careful, the CBP may be
-       * zero.
+       * buffer start address from the CBP.    A value of zero means that all
+       * bytes were transferred.
        */
 
       tmp = (uintptr_t)td->hw.cbp;
-      if (tmp != 0)
+      if (tmp == 0)
+        {
+          /* Set the (fake) CBP to the end of the buffer + 1 */
+
+          tmp = eplist->buflen;
+        }
+      else
         {
           paddr = sam_physramaddr((uintptr_t)eplist->buffer);
           DEBUGASSERT(tmp >= paddr);
@@ -3309,7 +3317,7 @@ static ssize_t sam_transfer(struct usbhost_driver_s *drvr, usbhost_ep_t ep,
    * transfer.
    */
 
-  ret = sam_wdhwait(rhport, ed);
+  ret = sam_wdhwait(rhport, ed, buffer, buflen);
   if (ret != OK)
     {
       usbhost_trace1(OHCI_TRACE1_DEVDISCONN, RHPORT(rhport));
@@ -3381,7 +3389,20 @@ static ssize_t sam_transfer(struct usbhost_driver_s *drvr, usbhost_ep_t ep,
   /* A transfer error occurred */
 
   usbhost_trace2(OHCI_TRACE2_BADTDSTATUS, RHPORT(rhport), ed->tdstatus);
-  ret = ed->tdstatus == TD_CC_STALL ? -EPERM : -EIO;
+  switch (ed->tdstatus)
+    {
+    case TD_CC_STALL:
+      ret = -EPERM;
+      break;
+
+    case TD_CC_USER:
+      ret = -ESHUTDOWN;
+      break;
+
+    default:
+      ret = -EIO;
+      break;
+    }
 
 errout:
   /* Make sure that there is no outstanding request on this endpoint */
@@ -3447,8 +3468,26 @@ static void sam_asynch_completion(struct sam_eplist_s *eplist)
     }
   else
     {
+      /* Map the bad completion status to something that a class driver
+       * might understand.
+       */
+
       usbhost_trace1(OHCI_TRACE1_BADTDSTATUS, ed->tdstatus);
-      nbytes = (ed->tdstatus == TD_CC_STALL) ? -EPERM : -EIO;
+
+      switch (ed->tdstatus)
+        {
+        case TD_CC_STALL:
+          nbytes = -EPERM;
+          break;
+
+        case TD_CC_USER:
+          nbytes = -ESHUTDOWN;
+          break;
+
+        default:
+          nbytes = -EIO;
+          break;
+        }
     }
 
   /* Extract the callback information before freeing the buffer */
@@ -3566,7 +3605,8 @@ errout:
  * Name: sam_cancel
  *
  * Description:
- *   Cancel a pending asynchronous transfer on an endpoint.
+ *   Cancel a pending transfer on an endpoint.  Cancelled synchronous or
+ *   asynchronous transfer will complete normally with the error -ESHUTDOWN.
  *
  * Input Parameters:
  *   drvr - The USB host driver instance obtained as a parameter from the call to
@@ -3580,7 +3620,6 @@ errout:
  *
  ************************************************************************************/
 
-#ifdef CONFIG_USBHOST_ASYNCH
 static int sam_cancel(struct usbhost_driver_s *drvr, usbhost_ep_t ep)
 {
   struct sam_eplist_s *eplist = (struct sam_eplist_s *)ep;
@@ -3597,18 +3636,15 @@ static int sam_cancel(struct usbhost_driver_s *drvr, usbhost_ep_t ep)
 
   flags  = irqsave();
 
-  /* It might be possible for no transfer to be in progress (callback == NULL),
-   * but it would be an usage error to use the interface to try to cancel a
-   * synchronous transfer (wdhwait == true).
+  /* It might be possible for no transfer to be in progress (callback == NULL
+   * and wdhwait == false)
    */
 
-  DEBUGASSERT(eplist->wdhwait == false);
+#ifdef CONFIG_USBHOST_ASYNCH
+  if (eplist->callback || eplist->wdhwait)
+#else
   if (eplist->wdhwait)
-    {
-      return -EINVAL;
-    }
-
-  if (eplist->callback)
+#endif
     {
       /* We really need some kind of atomic test and set to do this right */
 
@@ -3628,20 +3664,49 @@ static int sam_cancel(struct usbhost_driver_s *drvr, usbhost_ep_t ep)
           sam_tdfree(td);
           td    = next;
         }
+
+      ed->tdstatus = TD_CC_USER;
+
+      /* If there is a thread waiting for the transfer to complete, then
+       * wake up the thread.
+       */
+
+      if (eplist->wdhwait)
+        {
+#ifdef CONFIG_USBHOST_ASYNCH
+          /* Yes.. there should not also be a callback scheduled */
+
+          DEBUGASSERT(eplist->callback == NULL);
+#endif
+
+          /* Wake up the waiting thread */
+
+          sam_givesem(&eplist->wdhsem);
+          eplist->wdhwait = false;
+        }
+#ifdef CONFIG_USBHOST_ASYNCH
+      else
+        {
+          /* Otherwise, perform the callback */
+
+          sam_asynch_completion(eplist);
+        }
+#endif
     }
 
   /* Reset any pending activity indications */
 
   eplist->wdhwait  = false;
+#ifdef CONFIG_USBHOST_ASYNCH
   eplist->callback = NULL;
   eplist->arg      = NULL;
+#endif
   eplist->buffer   = NULL;
   eplist->buflen   = 0;
 
   irqrestore(flags);
   return OK;
 }
-#endif /* CONFIG_USBHOST_ASYNCH */
 
 /************************************************************************************
  * Name: sam_connect
@@ -3913,8 +3978,8 @@ struct usbhost_connection_s *sam_ohci_initialize(int controller)
       rhport->drvr.transfer       = sam_transfer;
 #ifdef CONFIG_USBHOST_ASYNCH
       rhport->drvr.asynch         = sam_asynch;
-      rhport->drvr.cancel         = sam_cancel;
 #endif
+      rhport->drvr.cancel         = sam_cancel;
 #ifdef CONFIG_USBHOST_HUB
       rhport->drvr.connect        = sam_connect;
 #endif
