@@ -1,5 +1,7 @@
+# Build NuttX on travis-ci.org.
 language: c
 before_install:
+  # Install the ARM C compiler.
   - sudo add-apt-repository -y ppa:terry.guo/gcc-arm-embedded
   - sudo apt-get update -qq
   - sudo apt-get install -qq gcc-arm-none-eabi
@@ -9,14 +11,13 @@ compiler:
   - gcc
 env:
   matrix:
+    # A list of configurations to build.
     - CONFIG=teensy-lc/nsh
-    - CONFIG=sama5d4-ek/nsh
-    - CONFIG=stm32f4discovery/netnsh
+    - CONFIG=olimex-lpc1766stk/nsh
 script:
   - cd nuttx
   - make -s distclean
-  - sed -ri "s/^CONFIG_HOST_WINDOWS=y/CONFIG_HOST_LINUX=y/" configs/$CONFIG/defconfig
-  - sed -ri "s/^CONFIG_WINDOWS_CYGWIN=y/#/" configs/$CONFIG/defconfig
   - sed -ri "s/^CONFIG_ARMV7M_TOOLCHAIN_.+=y/CONFIG_ARMV7M_TOOLCHAIN_GNU_EABIL=y/" configs/$CONFIG/defconfig
+  - sed -ri "s/^CONFIG_ARMV7M_OABI_TOOLCHAIN=y//" configs/$CONFIG/defconfig
   - pushd tools && ./configure.sh $CONFIG && popd
   - make -s
